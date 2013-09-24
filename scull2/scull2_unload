@@ -1,0 +1,9 @@
+#!/bin/sh
+module="scull2"
+device="scull2"
+
+# invoke rmmod with all arguments we got
+sudo rmmod $module $* || exit 1
+
+# Remove stale nodes
+sudo rm -f /dev/${device}0
