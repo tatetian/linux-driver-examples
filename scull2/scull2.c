@@ -7,6 +7,7 @@
 #include <linux/slab.h>
 #include <linux/fcntl.h>
 #include <asm/uaccess.h>
+#include <linux/proc_fs.h>
 
 MODULE_LICENSE("Dual BSD/GPL");
 
@@ -14,7 +15,7 @@ dev_t dev_id;
 unsigned int scull2_major, scull2_minor = 0, scull2_ndevs = 1;
 int qset_size = 1024;
 int quantum_bytes = 4096;
-
+int scull2_devices_num = 4;
 struct scull2_qset {
   void **data;
   struct scull2_qset *next;
@@ -28,9 +29,41 @@ struct scull2_dev {
   struct cdev cdev;
 };
 
-struct scull2_qset* scull2_get_qset(struct scull2_dev *dev, int index) {
-  int i = 0;
-  struct scull2_qset* qset = dev->qset;
+struct scull2_dev *scull2_device;
+
+int read_proc_scull2(char *buf, char **start, off_t offset, 
+                        int count, int *eof, void *data)
+{
+    int i, len = 0;
+    int limit = count - 80;
+    struct scull2_dev *sd = scull2_device;
+    struct scull2_qset *qs = sd->qset;
+    printk("start of read_proc_scull2\n");
+    if (down_interruptible(&sd->sem))
+    {
+       return -ERESTARTSYS;
+    }
+    for(; qs && len <= limit; qs = qs->next)
+    {
+       len += sprintf(buf + len, "item at %p, qset at %p\n", qs, qs->next);
+       printk("===========================================\n");
+       if (qs->data && !qs->next) 
+         for (i = 0; i < qset_size; i++) {
+           if (qs->data[i])
+           {
+              len += sprintf(buf + len," %4i: %8p\n", i, qs->data[i]);
+           }
+         }  
+    }
+     up(&sd->sem);
+    *eof = 1;
+   printk("end of\n");
+   return len;
+ }
+//////==============   
+ struct scull2_qset* scull2_get_qset(struct scull2_dev *dev, int index) {
+    int i = 0;
+    struct scull2_qset* qset = dev->qset;
 
   if (!qset) {
     qset = dev->qset = kmalloc(sizeof(struct scull2_qset), GFP_KERNEL);
@@ -251,6 +284,10 @@ static int scull2_init(void)
   sema_init(&dev->sem, 1);
   scull2_setup_cdev(dev);
 
+  scull2_device = dev;
+
+  create_proc_read_entry("scull2", 0, NULL, read_proc_scull2, NULL);
+
   printk(KERN_ALERT "Scull2 init successfully\n");
   return 0;
 }
@@ -258,6 +295,7 @@ static int scull2_init(void)
 static void scull2_exit(void)
 {
   unregister_chrdev_region(dev_id, scull2_ndevs);
+  remove_proc_entry("scull2", NULL);
   printk(KERN_ALERT "scull2 exit successfully\n");
 }
 
