@@ -2,7 +2,6 @@
  * Sample disk driver, from the beginning.
  */
 
-#include <linux/config.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/init.h>
@@ -31,19 +30,7 @@ static int hardsect_size = 512;
 module_param(hardsect_size, int, 0);
 static int nsectors = 1024;	/* How big the drive is */
 module_param(nsectors, int, 0);
-static int ndevices = 4;
-module_param(ndevices, int, 0);
-
-/*
- * The different "request modes" we can use.
- */
-enum {
-	RM_SIMPLE  = 0,	/* The extra-simple request function */
-	RM_FULL    = 1,	/* The full-blown version */
-	RM_NOQUEUE = 2,	/* Use make_request */
-};
-static int request_mode = RM_SIMPLE;
-module_param(request_mode, int, 0);
+static int ndevices = 1;
 
 /*
  * Minor number and partition management.
@@ -77,17 +64,16 @@ struct sbull_dev {
         struct timer_list timer;        /* For simulated media changes */
 };
 
+#define SBULL_DEV(blk_dev) (blk_dev->bd_disk->private_data)
+
 static struct sbull_dev *Devices = NULL;
 
 /*
  * Handle an I/O request.
  */
-static void sbull_transfer(struct sbull_dev *dev, unsigned long sector,
-		unsigned long nsect, char *buffer, int write)
+static void sbull_transfer(struct sbull_dev *dev, unsigned long offset,
+		unsigned long nbytes, char *buffer, int write)
 {
-	unsigned long offset = sector*KERNEL_SECTOR_SIZE;
-	unsigned long nbytes = nsect*KERNEL_SECTOR_SIZE;
-
 	if ((offset + nbytes) > dev->size) {
 		printk (KERN_NOTICE "Beyond-end write (%ld %ld)\n", offset, nbytes);
 		return;
@@ -101,28 +87,6 @@ static void sbull_transfer(struct sbull_dev *dev, unsigned long sector,
 /*
  * The simple form of the request function.
  */
-static void sbull_request(request_queue_t *q)
-{
-	struct request *req;
-
-	while ((req = elv_next_request(q)) != NULL) {
-		struct sbull_dev *dev = req->rq_disk->private_data;
-		if (! blk_fs_request(req)) {
-			printk (KERN_NOTICE "Skip non-fs request\n");
-			end_request(req, 0);
-			continue;
-		}
-    //    	printk (KERN_NOTICE "Req dev %d dir %ld sec %ld, nr %d f %lx\n",
-    //    			dev - Devices, rq_data_dir(req),
-    //    			req->sector, req->current_nr_sectors,
-    //    			req->flags);
-		sbull_transfer(dev, req->sector, req->current_nr_sectors,
-				req->buffer, rq_data_dir(req));
-		end_request(req, 1);
-	}
-}
-
-
 /*
  * Transfer a single BIO.
  */
@@ -130,96 +94,53 @@ static int sbull_xfer_bio(struct sbull_dev *dev, struct bio *bio)
 {
 	int i;
 	struct bio_vec *bvec;
-	sector_t sector = bio->bi_sector;
+  unsigned long offset = bio->bi_sector * hardsect_size; /* not sure */ 
+  char *buffer;
 
 	/* Do each segment independently. */
 	bio_for_each_segment(bvec, bio, i) {
-		char *buffer = __bio_kmap_atomic(bio, i, KM_USER0);
-		sbull_transfer(dev, sector, bio_cur_sectors(bio),
+    bio->bi_idx = i;
+		buffer = __bio_kmap_atomic(bio, i, KM_USER0);
+		sbull_transfer(dev, offset, bio_cur_bytes(bio),
 				buffer, bio_data_dir(bio) == WRITE);
-		sector += bio_cur_sectors(bio);
+		offset += bio_cur_bytes(bio);
 		__bio_kunmap_atomic(bio, KM_USER0);
 	}
 	return 0; /* Always "succeed" */
 }
 
 /*
- * Transfer a full request.
- */
-static int sbull_xfer_request(struct sbull_dev *dev, struct request *req)
-{
-	struct bio *bio;
-	int nsect = 0;
-    
-	rq_for_each_bio(bio, req) {
-		sbull_xfer_bio(dev, bio);
-		nsect += bio->bi_size/KERNEL_SECTOR_SIZE;
-	}
-	return nsect;
-}
-
-
-
-/*
- * Smarter request function that "handles clustering".
- */
-static void sbull_full_request(request_queue_t *q)
-{
-	struct request *req;
-	int sectors_xferred;
-	struct sbull_dev *dev = q->queuedata;
-
-	while ((req = elv_next_request(q)) != NULL) {
-		if (! blk_fs_request(req)) {
-			printk (KERN_NOTICE "Skip non-fs request\n");
-			end_request(req, 0);
-			continue;
-		}
-		sectors_xferred = sbull_xfer_request(dev, req);
-		if (! end_that_request_first(req, 1, sectors_xferred)) {
-			blkdev_dequeue_request(req);
-			end_that_request_last(req);
-		}
-	}
-}
-
-
-
-/*
  * The direct make request version.
  */
-static int sbull_make_request(request_queue_t *q, struct bio *bio)
+static void sbull_make_request(struct request_queue *q, struct bio *bio)
 {
 	struct sbull_dev *dev = q->queuedata;
 	int status;
 
 	status = sbull_xfer_bio(dev, bio);
-	bio_endio(bio, bio->bi_size, status);
-	return 0;
+	bio_endio(bio, status);
 }
 
 
 /*
  * Open and close.
  */
-
-static int sbull_open(struct inode *inode, struct file *filp)
+static int sbull_open(struct block_device *blk_dev, fmode_t mod)
 {
-	struct sbull_dev *dev = inode->i_bdev->bd_disk->private_data;
+	struct sbull_dev *dev = SBULL_DEV(blk_dev);
 
 	del_timer_sync(&dev->timer);
-	filp->private_data = dev;
 	spin_lock(&dev->lock);
 	if (! dev->users) 
-		check_disk_change(inode->i_bdev);
+		check_disk_change(blk_dev);
 	dev->users++;
 	spin_unlock(&dev->lock);
 	return 0;
 }
 
-static int sbull_release(struct inode *inode, struct file *filp)
+static int sbull_release(struct gendisk* gd, fmode_t mod)
 {
-	struct sbull_dev *dev = inode->i_bdev->bd_disk->private_data;
+	struct sbull_dev *dev = gd->private_data;
 
 	spin_lock(&dev->lock);
 	dev->users--;
@@ -278,16 +199,16 @@ void sbull_invalidate(unsigned long ldev)
  * The ioctl() implementation
  */
 
-int sbull_ioctl (struct inode *inode, struct file *filp,
+int sbull_ioctl (struct block_device * blk_dev, fmode_t mod,
                  unsigned int cmd, unsigned long arg)
 {
 	long size;
 	struct hd_geometry geo;
-	struct sbull_dev *dev = filp->private_data;
+	struct sbull_dev *dev = SBULL_DEV(blk_dev);
 
 	switch(cmd) {
-	    case HDIO_GETGEO:
-        	/*
+  case HDIO_GETGEO:
+      /*
 		 * Get geometry: since we are a virtual device, we have to make
 		 * up something plausible.  So we claim 16 sectors, four heads,
 		 * and calculate the corresponding number of cylinders.  We set the
@@ -314,7 +235,7 @@ int sbull_ioctl (struct inode *inode, struct file *filp,
 static struct block_device_operations sbull_ops = {
 	.owner           = THIS_MODULE,
 	.open 	         = sbull_open,
-	.release 	 = sbull_release,
+	.release 	       = sbull_release,
 	.media_changed   = sbull_media_changed,
 	.revalidate_disk = sbull_revalidate,
 	.ioctl	         = sbull_ioctl
@@ -345,35 +266,13 @@ static void setup_device(struct sbull_dev *dev, int which)
 	dev->timer.data = (unsigned long) dev;
 	dev->timer.function = sbull_invalidate;
 	
-	/*
-	 * The I/O queue, depending on whether we are using our own
-	 * make_request function or not.
-	 */
-	switch (request_mode) {
-	    case RM_NOQUEUE:
-		dev->queue = blk_alloc_queue(GFP_KERNEL);
-		if (dev->queue == NULL)
-			goto out_vfree;
-		blk_queue_make_request(dev->queue, sbull_make_request);
-		break;
-
-	    case RM_FULL:
-		dev->queue = blk_init_queue(sbull_full_request, &dev->lock);
-		if (dev->queue == NULL)
-			goto out_vfree;
-		break;
-
-	    default:
-		printk(KERN_NOTICE "Bad request mode %d, using simple\n", request_mode);
-        	/* fall into.. */
-	
-	    case RM_SIMPLE:
-		dev->queue = blk_init_queue(sbull_request, &dev->lock);
-		if (dev->queue == NULL)
-			goto out_vfree;
-		break;
-	}
-	blk_queue_hardsect_size(dev->queue, hardsect_size);
+  dev->queue = blk_alloc_queue(GFP_KERNEL);
+  if (dev->queue == NULL)
+    goto out_vfree;
+  blk_queue_make_request(dev->queue, sbull_make_request);
+  /* This function is no longer available in Linux 2.6.32.
+   * A possible replacement is blk_queue_physical_block_size()
+   * blk_queue_hardsect_size(dev->queue, hardsect_size); */
 	dev->queue->queuedata = dev;
 	/*
 	 * And the gendisk structure.
@@ -388,7 +287,7 @@ static void setup_device(struct sbull_dev *dev, int which)
 	dev->gd->fops = &sbull_ops;
 	dev->gd->queue = dev->queue;
 	dev->gd->private_data = dev;
-	snprintf (dev->gd->disk_name, 32, "sbull%c", which + 'a');
+	snprintf (dev->gd->disk_name, DISK_NAME_LEN, "sbull%c", which + 'a');
 	set_capacity(dev->gd, nsectors*(hardsect_size/KERNEL_SECTOR_SIZE));
 	add_disk(dev->gd);
 	return;
@@ -440,10 +339,7 @@ static void sbull_exit(void)
 			put_disk(dev->gd);
 		}
 		if (dev->queue) {
-			if (request_mode == RM_NOQUEUE)
-				blk_put_queue(dev->queue);
-			else
-				blk_cleanup_queue(dev->queue);
+      blk_put_queue(dev->queue);
 		}
 		if (dev->data)
 			vfree(dev->data);
