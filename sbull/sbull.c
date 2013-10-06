@@ -28,7 +28,7 @@ static int sbull_major = 0;
 module_param(sbull_major, int, 0);
 static int hardsect_size = 512;
 module_param(hardsect_size, int, 0);
-static int nsectors = 1024;	/* How big the drive is */
+static int nsectors = 1024 * 8;	/* How big the drive is */
 module_param(nsectors, int, 0);
 static int ndevices = 1;
 
@@ -50,12 +50,18 @@ static int ndevices = 1;
  */
 #define INVALIDATE_DELAY	30*HZ
 
+#define DEFAULT_SESSION_KEY 	1234
+
+struct dio;
+
 /*
  * The internal representation of our device.
  */
 struct sbull_dev {
         int size;                       /* Device size in sectors */
         u8 *data;                       /* The data array */
+	unsigned short *sector_uids;
+	unsigned short *sessions;
         short users;                    /* How many users */
         short media_change;             /* Flag a media change? */
         spinlock_t lock;                /* For mutual exclusion */
@@ -68,20 +74,51 @@ struct sbull_dev {
 
 static struct sbull_dev *Devices = NULL;
 
+#define sbull_for_each_sector(sector, pos, start, end)	\
+	for(pos = start, sector = start % hardsect_size;	\
+		pos < end; pos += hardsect_size, 		\
+		sector = pos % hardsect_size)	
+
 /*
  * Handle an I/O request.
  */
-static void sbull_transfer(struct sbull_dev *dev, unsigned long offset,
-		unsigned long nbytes, char *buffer, int write)
+static int sbull_transfer(struct sbull_dev *dev, unsigned long offset,
+		unsigned long nbytes, char *buffer, int write, 
+		unsigned long session_key)
 {
+	unsigned short session_uid;
+	unsigned long start, end, pos;
+	int sector;
+	int invalid_access = 0;
+
 	if ((offset + nbytes) > dev->size) {
 		printk (KERN_NOTICE "Beyond-end write (%ld %ld)\n", offset, nbytes);
-		return;
+		return 1;
 	}
-	if (write)
+	
+	session_uid = dev->sessions[session_key & 1];
+	start = offset; end = start + nbytes;
+	if (write) {
+		// assign new uids
+		sbull_for_each_sector(sector, pos, start, end) {
+			dev->sector_uids[sector] = session_uid;
+		}
 		memcpy(dev->data + offset, buffer, nbytes);
-	else
-		memcpy(buffer, dev->data + offset, nbytes);
+	}
+	else {
+		// check uids
+		sbull_for_each_sector(sector, pos, start, end) {
+			if(dev->sector_uids[sector] != session_uid) {
+				invalid_access = 1;
+				break;
+			}
+		}
+		if(invalid_access)
+			memset(buffer, 0, nbytes);
+		else
+			memcpy(buffer, dev->data + offset, nbytes);
+	}
+	return 0;
 }
 
 /*
@@ -94,15 +131,18 @@ static int sbull_xfer_bio(struct sbull_dev *dev, struct bio *bio)
 {
 	int i;
 	struct bio_vec *bvec;
-  unsigned long offset = bio->bi_sector * hardsect_size; /* not sure */ 
-  char *buffer;
+  	unsigned long offset = bio->bi_sector * hardsect_size; /* not sure */ 
+  	char *buffer;
+	int res;
 
 	/* Do each segment independently. */
 	bio_for_each_segment(bvec, bio, i) {
-    bio->bi_idx = i;
+    		bio->bi_idx = i;
 		buffer = __bio_kmap_atomic(bio, i, KM_USER0);
-		sbull_transfer(dev, offset, bio_cur_bytes(bio),
-				buffer, bio_data_dir(bio) == WRITE);
+		res = sbull_transfer(dev, offset, bio_cur_bytes(bio),
+				buffer, bio_data_dir(bio) == WRITE,
+				bio->bi_session_key);
+		if (res) return 1;
 		offset += bio_cur_bytes(bio);
 		__bio_kunmap_atomic(bio, KM_USER0);
 	}
@@ -117,10 +157,11 @@ static void sbull_make_request(struct request_queue *q, struct bio *bio)
 	struct sbull_dev *dev = q->queuedata;
 	int status;
 
+	printk(">>>>> sbull_make_request: session_key = %lu\n", bio->bi_session_key);
 	status = sbull_xfer_bio(dev, bio);
 	bio_endio(bio, status);
+	printk("<<<<<<< sbull_make_request\n");
 }
-
 
 /*
  * Open and close.
@@ -253,6 +294,12 @@ static void setup_device(struct sbull_dev *dev, int which)
 	memset (dev, 0, sizeof (struct sbull_dev));
 	dev->size = nsectors*hardsect_size;
 	dev->data = vmalloc(dev->size);
+	memset(dev->data, 0, dev->size);
+	dev->sector_uids = kmalloc(sizeof(unsigned short) * nsectors, GFP_KERNEL);
+	memset(dev->sector_uids, 0, sizeof(unsigned short) * nsectors);
+	dev->sessions = kmalloc(sizeof(unsigned short) * 2, GFP_KERNEL);
+	dev->sessions[0] = 0;
+	dev->sessions[1] = 1;
 	if (dev->data == NULL) {
 		printk (KERN_NOTICE "vmalloc failure.\n");
 		return;
@@ -302,6 +349,12 @@ static void setup_device(struct sbull_dev *dev, int which)
 static int __init sbull_init(void)
 {
 	int i;
+
+#ifndef CONFIG_FS_TSSD
+	printk(KERN_WARNING "sbull: TrustedSSD is not enabled");
+	return -EIO;
+#endif
+
 	/*
 	 * Get registered.
 	 */

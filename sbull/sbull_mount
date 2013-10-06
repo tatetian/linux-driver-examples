@@ -1,0 +1,4 @@
+#!/bin/bash
+sudo gdisk /dev/sbulla
+sudo mkfs -t ext4 /dev/sbulla
+sudo mount /dev/sbulla /mnt/sbulla

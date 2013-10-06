@@ -15,7 +15,7 @@ module="sbull"
 device="sbull"
 mode="666"
 chardevice="sbullr"
-minors=16
+minors=1
 
 # Group: since distributions do it differently, look for wheel or use staff
 if grep '^staff:' /etc/group > /dev/null; then

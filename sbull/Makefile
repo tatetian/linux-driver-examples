@@ -19,7 +19,8 @@ obj-m	:= sbull.o
 
 else
 
-KERNELDIR ?= /lib/modules/$(shell uname -r)/build
+#KERNELDIR ?= /lib/modules/$(shell uname -r)/build
+KERNELDIR ?= /home/tian/Workspace/linux-kernel/linux-3.2.0 
 PWD       := $(shell pwd)
 
 default:
